@@ -23,19 +23,40 @@ def connect():
     return psycopg.connect(DSN, row_factory=dict_row)
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS jobs (
-    id serial PRIMARY KEY,
-    sheet text NOT NULL,
-    cyan_mm double precision NOT NULL,
-    magenta_mm double precision NOT NULL,
-    status text NOT NULL,
-    verdict text NOT NULL DEFAULT '',
-    reason text NOT NULL DEFAULT '',
-    created_by text NOT NULL,
-    created_at timestamptz NOT NULL
-);
-"""
+SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id serial PRIMARY KEY,
+        sheet text NOT NULL,
+        machine text NOT NULL DEFAULT '',
+        cyan_mm double precision NOT NULL,
+        magenta_mm double precision NOT NULL,
+        status text NOT NULL,
+        verdict text NOT NULL DEFAULT '',
+        reason text NOT NULL DEFAULT '',
+        created_by text NOT NULL,
+        created_at timestamptz NOT NULL
+    )
+    """,
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine text NOT NULL DEFAULT ''",
+    """
+    CREATE TABLE IF NOT EXISTS machine_gates (
+        machine text PRIMARY KEY,
+        status text NOT NULL DEFAULT 'open',
+        updated_by text NOT NULL DEFAULT '',
+        updated_at timestamptz NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gate_events (
+        id serial PRIMARY KEY,
+        machine text NOT NULL,
+        action text NOT NULL,
+        actor text NOT NULL,
+        created_at timestamptz NOT NULL
+    )
+    """,
+]
 
 
 class LoginIn(BaseModel):
@@ -45,6 +66,7 @@ class LoginIn(BaseModel):
 
 class JobIn(BaseModel):
     sheet: str
+    machine: str
     cyan_mm: float
     magenta_mm: float
 
@@ -73,15 +95,23 @@ app = FastAPI(title="印刷套准复核台")
 @app.on_event("startup")
 def startup():
     with connect() as conn:
-        conn.execute(SCHEMA)
+        for stmt in SCHEMA:
+            conn.execute(stmt)
+        now = datetime.now(timezone.utc)
         n = conn.execute("SELECT COUNT(*) AS n FROM jobs").fetchone()["n"]
         if n == 0:
-            now = datetime.now(timezone.utc)
             conn.execute(
-                """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by, created_at)
+                """INSERT INTO jobs (sheet, machine, cyan_mm, magenta_mm, status, verdict, reason, created_by, created_at)
                    VALUES
-                   ('封面-01', 0.05, -0.04, 'pending', '', '', 'printer', %s),
-                   ('内页-09', 0.40, 0.02, 'pending', '', '', 'printer', %s)""",
+                   ('封面-01', '甲机', 0.05, -0.04, 'pending', '', '', 'printer', %s),
+                   ('内页-09', '乙机', 0.40, 0.02, 'pending', '', '', 'printer', %s)""",
+                (now, now),
+            )
+        g = conn.execute("SELECT COUNT(*) AS n FROM machine_gates").fetchone()["n"]
+        if g == 0:
+            conn.execute(
+                """INSERT INTO machine_gates (machine, status, updated_by, updated_at)
+                   VALUES ('甲机', 'open', 'system', %s), ('乙机', 'open', 'system', %s)""",
                 (now, now),
             )
         conn.commit()
@@ -106,18 +136,79 @@ def login(body: LoginIn):
 def list_jobs(_user: dict = Depends(current_user)):
     with connect() as conn:
         return conn.execute(
-            "SELECT id, sheet, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
+            "SELECT id, sheet, machine, cyan_mm, magenta_mm, status, verdict, reason, created_by FROM jobs ORDER BY id DESC"
         ).fetchall()
 
 
 @app.post("/api/jobs", status_code=202)
 def enqueue(body: JobIn, user: dict = Depends(require_writer)):
+    machine = body.machine.strip()
+    if not machine:
+        raise HTTPException(status_code=422, detail="机台名不能为空")
+    now = datetime.now(timezone.utc)
     with connect() as conn:
+        conn.execute(
+            """INSERT INTO machine_gates (machine, status, updated_by, updated_at)
+               VALUES (%s, 'open', %s, %s)
+               ON CONFLICT (machine) DO NOTHING""",
+            (machine, user["username"], now),
+        )
         row = conn.execute(
-            """INSERT INTO jobs (sheet, cyan_mm, magenta_mm, status, created_by, created_at)
-               VALUES (%s, %s, %s, 'pending', %s, %s)
-               RETURNING id, sheet, status, verdict""",
-            (body.sheet.strip(), body.cyan_mm, body.magenta_mm, user["username"], datetime.now(timezone.utc)),
-        ).fetchone()
+            """INSERT INTO jobs (sheet, machine, cyan_mm, magenta_mm, status, created_by, created_at)
+               VALUES (%s, %s, %s, %s, 'pending', %s, %s)
+               RETURNING id, sheet, machine, status, verdict""",
+            (body.sheet.strip(), machine, body.cyan_mm, body.magenta_mm, user["username"], now),
+        )
         conn.commit()
     return row
+
+
+@app.get("/api/gates")
+def list_gates(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT machine, status, updated_by, updated_at FROM machine_gates ORDER BY machine"
+        ).fetchall()
+
+
+@app.get("/api/gate-events")
+def list_gate_events(_user: dict = Depends(current_user)):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT id, machine, action, actor, created_at FROM gate_events ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+
+
+def set_gate(machine: str, action: str, user: dict) -> dict:
+    if user["role"] != "writer":
+        raise HTTPException(status_code=403, detail="仅印刷员可操作闸门")
+    machine = machine.strip()
+    if not machine:
+        raise HTTPException(status_code=422, detail="机台名不能为空")
+    status = "paused" if action == "pause" else "open"
+    now = datetime.now(timezone.utc)
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO machine_gates (machine, status, updated_by, updated_at)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (machine) DO UPDATE
+               SET status = EXCLUDED.status, updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at
+               RETURNING machine, status, updated_by, updated_at""",
+            (machine, status, user["username"], now),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO gate_events (machine, action, actor, created_at) VALUES (%s, %s, %s, %s)",
+            (machine, action, user["username"], now),
+        )
+        conn.commit()
+    return row
+
+
+@app.post("/api/gates/{machine}/pause")
+def pause_gate(machine: str, user: dict = Depends(current_user)):
+    return set_gate(machine, "pause", user)
+
+
+@app.post("/api/gates/{machine}/resume")
+def resume_gate(machine: str, user: dict = Depends(current_user)):
+    return set_gate(machine, "resume", user)
