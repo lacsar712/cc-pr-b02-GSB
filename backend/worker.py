@@ -8,6 +8,41 @@ from rules import judge
 
 DSN = os.environ["DATABASE_URL"]
 
+SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS jobs (
+        id serial PRIMARY KEY,
+        sheet text NOT NULL,
+        machine text NOT NULL DEFAULT '',
+        cyan_mm double precision NOT NULL,
+        magenta_mm double precision NOT NULL,
+        status text NOT NULL,
+        verdict text NOT NULL DEFAULT '',
+        reason text NOT NULL DEFAULT '',
+        created_by text NOT NULL,
+        created_at timestamptz NOT NULL
+    )
+    """,
+    "ALTER TABLE jobs ADD COLUMN IF NOT EXISTS machine text NOT NULL DEFAULT ''",
+    """
+    CREATE TABLE IF NOT EXISTS machine_gates (
+        machine text PRIMARY KEY,
+        paused boolean NOT NULL DEFAULT false,
+        updated_by text NOT NULL DEFAULT '',
+        updated_at timestamptz
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS gate_events (
+        id serial PRIMARY KEY,
+        machine text NOT NULL,
+        action text NOT NULL,
+        actor text NOT NULL,
+        created_at timestamptz NOT NULL
+    )
+    """,
+]
+
 
 def connect():
     last = None
@@ -22,29 +57,20 @@ def connect():
 
 def ensure():
     with connect() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS jobs (
-                id serial PRIMARY KEY,
-                sheet text NOT NULL,
-                cyan_mm double precision NOT NULL,
-                magenta_mm double precision NOT NULL,
-                status text NOT NULL,
-                verdict text NOT NULL DEFAULT '',
-                reason text NOT NULL DEFAULT '',
-                created_by text NOT NULL,
-                created_at timestamptz NOT NULL
-            )"""
-        )
+        for statement in SCHEMA:
+            conn.execute(statement)
         conn.commit()
 
 
 def claim_once(conn):
     row = conn.execute(
         """WITH picked AS (
-             SELECT id FROM jobs
-             WHERE status = 'pending'
-             ORDER BY id
-             FOR UPDATE SKIP LOCKED
+             SELECT j.id FROM jobs j
+             LEFT JOIN machine_gates g ON g.machine = j.machine
+             WHERE j.status = 'pending'
+               AND (g.paused IS NULL OR g.paused = false)
+             ORDER BY j.id
+             FOR UPDATE OF j SKIP LOCKED
              LIMIT 1
            )
            UPDATE jobs SET status = 'running'
